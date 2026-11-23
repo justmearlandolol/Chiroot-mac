@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Chiroot Desktop",
+  "version": "1.0.0",
+  "identifier": "id.my.chiroot.desktop",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Music",
+    "shortDescription": "Lightweight macOS desktop application for Chiroot Audio Player",
+    "longDescription": "Chiroot Desktop is a fast, minimal-RAM macOS desktop application for Chiroot (https://www.chiroot.my.id/Main.html), engineered for Intel Macs running macOS High Sierra 10.13.6 and newer.",
+    "macOS": {
+      "minimumSystemVersion": "10.13",
+      "infoPlist": "Info.plist",
+      "hardenedRuntime": false,
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["chiroot"]
+      }
+    }
+  }
+}

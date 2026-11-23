@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>Chiroot Desktop</string>
+  <key>CFBundleName</key>
+  <string>Chiroot Desktop</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Chiroot Desktop uses microphone permission so macOS allows enumerating connected audio input/output devices and Bluetooth headsets.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Chiroot Desktop uses audio device access to detect connected headphones, microphones, and Bluetooth headsets.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Chiroot Desktop uses Bluetooth audio device access to detect connected wireless headsets.</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoads</key>
+    <false/>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>id.my.chiroot.desktop.oauth</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>chiroot</string>
+      </array>
+    </dict>
+  </array>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>MP3 Audio</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.mp3</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>mp3</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>JSON Document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.json</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>json</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Cover Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.png</string>
+        <string>public.jpeg</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>png</string>
+        <string>jpg</string>
+        <string>jpeg</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

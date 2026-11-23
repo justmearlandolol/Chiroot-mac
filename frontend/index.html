@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chiroot Desktop</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f4ee;
+      --fg: #1d1b18;
+      --muted: #5c564c;
+      --card: #ffffff;
+      --border: #ddd6c8;
+      --accent: #d4ec8a;
+      --accent-fg: #151710;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171715;
+        --fg: #f3f1ea;
+        --muted: #a9a499;
+        --card: #21211e;
+        --border: #34342f;
+        --accent: #d4ec8a;
+        --accent-fg: #151710;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    main {
+      min-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .panel {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 24px;
+      text-align: center;
+    }
+    .badge {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 16px;
+      border-radius: 16px;
+      background: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    p {
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+    .detail {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .actions {
+      margin-top: 20px;
+      display: none;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .actions.visible {
+      display: flex;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--accent);
+      color: var(--accent-fg);
+      border-color: transparent;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel" aria-live="polite">
+      <div class="badge" aria-hidden="true">
+        <svg viewBox="0 0 100 100" width="44" height="44">
+          <polygon points="50,6 60,36 92,35 67,54 78,82 54,67 44,94 37,65 8,68 32,48 16,24 44,35" fill="#1b1c17"/>
+          <ellipse cx="44" cy="48" rx="4.8" ry="9" fill="#f7f4ec"/>
+          <ellipse cx="58" cy="48" rx="4.8" ry="9" fill="#f7f4ec"/>
+        </svg>
+      </div>
+      <h1 id="heading">Chiroot Desktop</h1>
+      <p id="status">Connecting to Chiroot…</p>
+      <p class="detail" id="detail"></p>
+      <div class="actions" id="actions">
+        <button type="button" class="primary" id="btn-retry">Retry Connection</button>
+        <button type="button" id="btn-browser">Open in Browser</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    (function () {
+      var TARGET_URL = 'https://www.chiroot.my.id/Main.html';
+      var statusEl = document.getElementById('status');
+      var detailEl = document.getElementById('detail');
+      var actionsEl = document.getElementById('actions');
+      var retryBtn = document.getElementById('btn-retry');
+      var browserBtn = document.getElementById('btn-browser');
+
+      function tauriInvoke(cmd, args) {
+        if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+          return window.__TAURI__.core.invoke(cmd, args || {});
+        }
+        return Promise.reject(new Error('Tauri IPC bridge unavailable'));
+      }
+
+      function showError(message) {
+        statusEl.textContent = 'Unable to load Chiroot right now.';
+        detailEl.textContent = message || 'Please check your internet connection and try again.';
+        actionsEl.classList.add('visible');
+        retryBtn.disabled = false;
+      }
+
+      function connect() {
+        actionsEl.classList.remove('visible');
+        retryBtn.disabled = true;
+        statusEl.textContent = 'Connecting to Chiroot…';
+        detailEl.textContent = '';
+
+        tauriInvoke('check_chiroot_reachable')
+          .then(function (info) {
+            if (info && info.reachable) {
+              statusEl.textContent = 'Opening Chiroot…';
+              window.location.replace(TARGET_URL);
+            } else {
+              showError((info && info.error) || 'Chiroot did not respond.');
+            }
+          })
+          .catch(function () {
+            // Fallback direct navigation if IPC check isn't available yet
+            window.location.replace(TARGET_URL);
+          });
+      }
+
+      retryBtn.addEventListener('click', connect);
+      browserBtn.addEventListener('click', function () {
+        tauriInvoke('open_external_url', { url: TARGET_URL }).catch(function () {});
+      });
+
+      connect();
+    })();
+  </script>
+</body>
+</html>
