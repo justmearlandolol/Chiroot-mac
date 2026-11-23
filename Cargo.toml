@@ -1,0 +1,33 @@
+[package]
+name = "chiroot-desktop"
+version = "1.0.0"
+edition = "2021"
+description = "Chiroot Desktop — Extremely lightweight macOS desktop application for Chiroot Audio Player"
+authors = ["Chiroot"]
+license = "MIT"
+default-run = "chiroot-desktop"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+# Pure-Rust HTTPS client using rustls + bundled Mozilla root certificates
+# so TLS works reliably on macOS High Sierra 10.13.6 without depending on
+# outdated system root CAs or OpenSSL.
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
