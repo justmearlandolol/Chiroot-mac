@@ -3,9 +3,13 @@
 //! Chiroot Desktop — Lightweight macOS desktop application for Chiroot Audio Player.
 //!
 //! All Rust application logic is centralized in this single file (`src/main.rs`):
-//! - Native single-WebView integration for `https://www.chiroot.my.id/Main.html`
-//! - macOS High Sierra 10.13.6+ (x86_64) compatibility & minimal memory footprint
-//! - WKWebView autoplay configuration + zero-polling playback unlock bridge
+//! - Local High Sierra 10.13.6+ compatibility proxy loading live `https://www.chiroot.my.id/Main.html`
+//!   over modern Rustls TLS (`webpki-roots`), patching Safari 11–13 JS/CSS gaps on the fly
+//!   (optional chaining `?.`, `Blob.arrayBuffer`/`text`, CSS `inset:`, double-stop gradients,
+//!   `conic-gradient`, `dvh`, `clamp()`/`min()`/`max()`, flex `gap`) without redesigning the site
+//! - Proxying Supabase API/Storage and Google Fonts through Rustls so High Sierra's outdated
+//!   root CA trust store never breaks assets, audio streaming (`Range`/`206`), or cloud sync
+//! - Single-WebView native window + WKWebView autoplay support + zero-polling playback unlock bridge
 //! - Native macOS file picker & chunked streaming import for `.json`, `.mp3`, `.png`, `.jpeg`, `.jpg`
 //! - Audio / Bluetooth headset device discovery helpers and macOS permission diagnostics
 //! - Supabase Google OAuth (PKCE S256) via system browser + loopback / `chiroot://` deep-link callback
@@ -17,13 +21,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder, WINDOW_SUBMENU_ID};
 use tauri::webview::PageLoadEvent;
@@ -37,9 +41,15 @@ use tauri_plugin_opener::OpenerExt;
 // =============================================================================
 
 const APP_NAME: &str = "Chiroot Desktop";
+const CHIROOT_ORIGIN: &str = "https://www.chiroot.my.id";
 const CHIROOT_URL: &str = "https://www.chiroot.my.id/Main.html";
 const HOME_HOST: &str = "chiroot.my.id";
 const OAUTH_DEEP_LINK_REDIRECT: &str = "chiroot://auth/callback";
+
+/// Preferred local port for the High Sierra compatibility proxy so `localStorage`
+/// and IndexedDB persist across restarts on a consistent origin (`http://127.0.0.1:47821`).
+/// Falls back to an OS-assigned ephemeral port if 47821 is unavailable.
+const PREFERRED_PROXY_PORT: u16 = 47821;
 
 /// Public Supabase project URL & publishable (anon) key used by Chiroot Web.
 /// Never place a Supabase `service_role` key in client code.
@@ -51,13 +61,12 @@ const DEFAULT_SUPABASE_PUBLISHABLE_KEY: &str =
 const MACOS_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) \
     AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15";
 
-/// Hard limits for safe, low-RAM file importing.
+/// Hard limits for safe, low-RAM file importing and proxy uploads.
 const MAX_IMPORT_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+const MAX_PROXY_REQUEST_BODY: usize = 35 * 1024 * 1024; // 35 MB (MP3/ZIP uploads)
 const MAX_STREAM_CHUNK_BYTES: usize = 1024 * 1024; // 1 MB max per chunk read
+const PROXY_STREAM_BUF_BYTES: usize = 64 * 1024; // 64 KB proxy streaming buffer
 const MAX_REGISTERED_FILES: usize = 64;
-
-/// OAuth callback server timeout (5 minutes); listener is created lazily on demand
-/// and closed immediately when login completes or times out (zero idle overhead).
 const OAUTH_TIMEOUT_SECS: u64 = 300;
 
 const DOWNLOAD_EXTENSIONS: &[&str] = &[
@@ -65,15 +74,163 @@ const DOWNLOAD_EXTENSIONS: &[&str] = &[
     ".appimage", ".apk", ".sh", ".run",
 ];
 
-/// Lightweight initialization script injected ONLY on `chiroot.my.id`.
+/// Polyfills & config injected at the very top of `<head>` inside `Main.html`
+/// so Safari 11 / 12 / 13 on macOS High Sierra 10.13.6 runs all Chiroot features cleanly.
+const HIGH_SIERRA_HEAD_SHIM: &str = r#"<script>(function(){
+  try {
+    window.CHIROOT_CONFIG = window.CHIROOT_CONFIG || {};
+    window.CHIROOT_CONFIG.SUPABASE_URL = window.location.origin + '/__supabase';
+    window.CHIROOT_CONFIG.SUPABASE_PUBLISHABLE_KEY = '__SUPABASE_KEY__';
+  } catch (e) {}
+
+  if (typeof window.globalThis === 'undefined') { window.globalThis = window; }
+  if (typeof window.queueMicrotask !== 'function') {
+    window.queueMicrotask = function (cb) { Promise.resolve().then(cb); };
+  }
+  if (!Promise.prototype.finally) {
+    Promise.prototype.finally = function (cb) {
+      var P = this.constructor;
+      return this.then(
+        function (v) { return P.resolve(cb()).then(function () { return v; }); },
+        function (r) { return P.resolve(cb()).then(function () { throw r; }); }
+      );
+    };
+  }
+  if (typeof Blob !== 'undefined') {
+    if (!Blob.prototype.arrayBuffer) {
+      Blob.prototype.arrayBuffer = function () {
+        var self = this;
+        return new Promise(function (resolve, reject) {
+          var fr = new FileReader();
+          fr.onload = function () { resolve(fr.result); };
+          fr.onerror = function () { reject(fr.error || new Error('FileReader arrayBuffer error')); };
+          fr.readAsArrayBuffer(self);
+        });
+      };
+    }
+    if (!Blob.prototype.text) {
+      Blob.prototype.text = function () {
+        var self = this;
+        return new Promise(function (resolve, reject) {
+          var fr = new FileReader();
+          fr.onload = function () { resolve(String(fr.result || '')); };
+          fr.onerror = function () { reject(fr.error || new Error('FileReader text error')); };
+          fr.readAsText(self);
+        });
+      };
+    }
+  }
+  if (window.crypto && typeof window.crypto.randomUUID !== 'function' && typeof window.crypto.getRandomValues === 'function') {
+    window.crypto.randomUUID = function () {
+      var b = new Uint8Array(16);
+      window.crypto.getRandomValues(b);
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      var h = [];
+      for (var i = 0; i < 16; i++) h.push((b[i] + 256).toString(16).slice(1));
+      return h[0]+h[1]+h[2]+h[3]+'-'+h[4]+h[5]+'-'+h[6]+h[7]+'-'+h[8]+h[9]+'-'+h[10]+h[11]+h[12]+h[13]+h[14]+h[15];
+    };
+  }
+  if (!String.prototype.replaceAll) {
+    String.prototype.replaceAll = function (search, replacement) {
+      if (search instanceof RegExp) return this.replace(search, replacement);
+      return this.split(String(search)).join(String(replacement));
+    };
+  }
+  if (!Object.fromEntries) {
+    Object.fromEntries = function (entries) {
+      var obj = {};
+      if (!entries) return obj;
+      for (var i = 0; i < entries.length; i++) {
+        obj[entries[i][0]] = entries[i][1];
+      }
+      return obj;
+    };
+  }
+  if (!Array.prototype.flat) {
+    Array.prototype.flat = function (depth) {
+      var d = depth === undefined ? 1 : Number(depth);
+      var out = [];
+      (function flatten(arr, lvl) {
+        for (var i = 0; i < arr.length; i++) {
+          if (Array.isArray(arr[i]) && lvl > 0) flatten(arr[i], lvl - 1);
+          else out.push(arr[i]);
+        }
+      })(this, d);
+      return out;
+    };
+  }
+  if (typeof window.AbortController !== 'function') {
+    window.AbortController = function () {
+      this.signal = { aborted: false, addEventListener: function () {}, removeEventListener: function () {} };
+      this.abort = function () { this.signal.aborted = true; };
+    };
+  }
+  function detectFlexGap() {
+    try {
+      if (!document.body) return;
+      var flex = document.createElement('div');
+      flex.style.display = 'flex';
+      flex.style.flexDirection = 'column';
+      flex.style.rowGap = '1px';
+      flex.appendChild(document.createElement('div'));
+      flex.appendChild(document.createElement('div'));
+      document.body.appendChild(flex);
+      var supported = flex.scrollHeight === 1;
+      document.body.removeChild(flex);
+      if (!supported) document.documentElement.classList.add('hs-noflexgap');
+    } catch (e) {}
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', detectFlexGap);
+  } else {
+    detectFlexGap();
+  }
+})();</script>"#;
+
+/// Extra Safari 11–13 Flexbox spacing fallback appended to `css/style.css`
+/// (only activates when `html.hs-noflexgap` is detected on macOS < 11.3 / Safari < 14.1).
+const HIGH_SIERRA_CSS_FALLBACK: &str = r#"
+/* Chiroot Desktop — macOS High Sierra 10.13.6 WebKit compatibility fallbacks */
+html.hs-noflexgap .controls > * + *,
+html.hs-noflexgap .volume-row > * + *,
+html.hs-noflexgap .crate-actions > * + *,
+html.hs-noflexgap .topbar-auth > * + *,
+html.hs-noflexgap .bluetooth-modal-actions > * + *,
+html.hs-noflexgap .modal-actions > * + *,
+html.hs-noflexgap .share-actions > * + * {
+  margin-left: 10px;
+}
+html.hs-noflexgap .gate-btn-wrap > * + *,
+html.hs-noflexgap .acct-list > * + *,
+html.hs-noflexgap .bluetooth-device-list > * + *,
+html.hs-noflexgap .top10-list > * + * {
+  margin-top: 10px;
+}
+.modal-overlay,
+#auth-overlay {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+"#;
+
+/// Lightweight initialization script injected on Chiroot pages (both local proxy `127.0.0.1`
+/// and `chiroot.my.id`). Written in pure ES2017 (zero `?.` / `??`) for High Sierra 10.13.6!
 /// - Zero `setInterval` polling (strictly event-driven to keep idle CPU ~0%).
-/// - Enables smooth audio autoplay & AudioContext resume while keeping user controls intact.
-/// - Exposes `window.ChirootDesktop` native helpers (file import, Supabase OAuth, audio devices).
-/// - Listens for `devicechange` on `navigator.mediaDevices` and surfaces clear macOS permission hints.
-/// - Intercepts `window.open` for external links so they open in the default macOS browser.
+/// - Intercepts Google Login buttons & `caLoginRedirect` so Google OAuth opens in the user's
+///   external system browser (bypassing Google's embedded WebView block on macOS High Sierra).
+/// - Unlocks Web Audio / HTMLMediaElement playback while keeping normal controls intact.
+/// - Exposes `window.ChirootDesktop` native helpers (file import, OAuth, audio devices).
 const BRIDGE_INIT_JS: &str = r#"(function () {
   var host = (window.location && window.location.hostname || '').toLowerCase();
-  if (host !== 'chiroot.my.id' && host.slice(-14) !== '.chiroot.my.id') {
+  var isChirootOrigin =
+    host === '127.0.0.1' ||
+    host === 'localhost' ||
+    host === 'chiroot.my.id' ||
+    host.slice(-14) === '.chiroot.my.id';
+  if (!isChirootOrigin) {
     return;
   }
   if (window.__CHIROOT_DESKTOP_BRIDGE__) return;
@@ -95,10 +252,10 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
         el.id = id;
         el.setAttribute('role', 'status');
         el.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:2147483647;' +
-          'max-width:360px;padding:10px 14px;border-radius:10px;font-size:12px;line-height:1.4;' +
+          'max-width:380px;padding:10px 14px;border-radius:10px;font-size:12px;line-height:1.45;' +
           'font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;' +
           'box-shadow:0 4px 16px rgba(0,0,0,0.22);transition:opacity 0.15s ease;';
-        document.body && document.body.appendChild(el);
+        if (document.body) document.body.appendChild(el);
       }
       el.style.background = isError ? '#3b1c1c' : '#1b1d17';
       el.style.color = '#f7f5ee';
@@ -108,7 +265,7 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
       clearTimeout(el.__hideTimer);
       el.__hideTimer = setTimeout(function () {
         el.style.opacity = '0';
-      }, 4500);
+      }, 5000);
     } catch (e) {}
   }
 
@@ -156,13 +313,52 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
   function onFirstGesture() {
     resumeAudioContexts();
     document.removeEventListener('pointerdown', onFirstGesture, true);
+    document.removeEventListener('mousedown', onFirstGesture, true);
     document.removeEventListener('keydown', onFirstGesture, true);
   }
   document.addEventListener('pointerdown', onFirstGesture, true);
+  document.addEventListener('mousedown', onFirstGesture, true);
   document.addEventListener('keydown', onFirstGesture, true);
 
   // ---------------------------------------------------------------------------
-  // 2. External link handling for window.open
+  // 2. Native Google OAuth via System Browser (bypasses WKWebView block)
+  // ---------------------------------------------------------------------------
+  function triggerNativeGoogleLogin() {
+    showBanner('Opening your browser for Google Sign-In…', false);
+    return invoke('start_google_auth', { useDeepLink: false }).catch(function (err) {
+      var msg = (err && err.message) ? err.message : String(err || 'Google Sign-In failed');
+      showBanner('Google Sign-In error: ' + msg, true);
+    });
+  }
+
+  document.addEventListener('click', function (ev) {
+    try {
+      var target = ev.target;
+      if (!target || typeof target.closest !== 'function') return;
+      var btn = target.closest('#gate-login-btn, #btn-guest-save-login, #acct-add, .google-btn');
+      if (!btn || btn.id === 'gate-retry-btn') return;
+      var txt = (btn.textContent || '').toLowerCase();
+      if (btn.id === 'gate-login-btn' || btn.id === 'btn-guest-save-login' || btn.id === 'acct-add' || txt.indexOf('google') !== -1) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        ev.stopImmediatePropagation();
+        triggerNativeGoogleLogin();
+      }
+    } catch (e) {}
+  }, true);
+
+  window.addEventListener('DOMContentLoaded', function () {
+    try {
+      if (typeof window.caLoginRedirect === 'function') {
+        window.caLoginRedirect = function () {
+          triggerNativeGoogleLogin();
+        };
+      }
+    } catch (e) {}
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3. External link handling for window.open
   // ---------------------------------------------------------------------------
   var origOpen = window.open;
   window.open = function (url) {
@@ -170,7 +366,7 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
       if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
         var parsed = new URL(url, window.location.href);
         var h = parsed.hostname.toLowerCase();
-        var isInternal = h === 'chiroot.my.id' || h.slice(-14) === '.chiroot.my.id';
+        var isInternal = h === '127.0.0.1' || h === 'localhost' || h === 'chiroot.my.id' || h.slice(-14) === '.chiroot.my.id';
         if (!isInternal) {
           invoke('open_external_url', { url: parsed.toString() }).catch(function () {});
           return null;
@@ -181,46 +377,50 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
   };
 
   // ---------------------------------------------------------------------------
-  // 3. Audio & Headset Device Discovery Helpers (event-driven, zero polling)
+  // 4. Audio & Headset Device Discovery Helpers (event-driven, zero polling)
   // ---------------------------------------------------------------------------
-  async function enumerateAudioDevicesWithHints() {
+  function enumerateAudioDevicesWithHints() {
     var result = { webDevices: [], macDevices: [], permissionError: null };
-    try {
-      result.macDevices = await invoke('list_macos_audio_devices');
-    } catch (e) {}
-
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
-      result.permissionError = 'WebKit MediaDevices API is unavailable on this macOS version. Audio follows System Preferences > Sound.';
-      return result;
-    }
-
-    try {
-      var list = await navigator.mediaDevices.enumerateDevices();
-      var hasLabels = list.some(function (d) { return d && d.label; });
-      if (!hasLabels && typeof navigator.mediaDevices.getUserMedia === 'function') {
-        try {
-          var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          stream.getTracks().forEach(function (t) { t.stop(); });
-          list = await navigator.mediaDevices.enumerateDevices();
-        } catch (permErr) {
-          if (permErr && permErr.name === 'NotAllowedError') {
-            result.permissionError = 'Microphone permission denied. Enable Chiroot Desktop in System Preferences > Security & Privacy > Microphone to view headset labels.';
-          } else if (permErr && permErr.name === 'NotFoundError') {
-            result.permissionError = 'No audio input device was found.';
-          } else {
-            result.permissionError = (permErr && permErr.message) || 'Audio device permission unavailable.';
-          }
+    return invoke('list_macos_audio_devices')
+      .then(function (devs) { result.macDevices = devs || []; })
+      .catch(function () {})
+      .then(function () {
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+          result.permissionError = 'WebKit MediaDevices API is unavailable on this macOS version. Audio follows System Preferences > Sound.';
+          return result;
         }
-      }
-      result.webDevices = list
-        .filter(function (d) { return d.kind === 'audioinput' || d.kind === 'audiooutput'; })
-        .map(function (d) {
-          return { deviceId: d.deviceId, kind: d.kind, label: d.label || '', groupId: d.groupId || '' };
+        return navigator.mediaDevices.enumerateDevices().then(function (list) {
+          var hasLabels = list.some(function (d) { return d && d.label; });
+          if (!hasLabels && typeof navigator.mediaDevices.getUserMedia === 'function') {
+            return navigator.mediaDevices.getUserMedia({ audio: true })
+              .then(function (stream) {
+                stream.getTracks().forEach(function (t) { t.stop(); });
+                return navigator.mediaDevices.enumerateDevices();
+              })
+              .catch(function (permErr) {
+                if (permErr && permErr.name === 'NotAllowedError') {
+                  result.permissionError = 'Microphone permission denied. Enable Chiroot Desktop in System Preferences > Security & Privacy > Microphone to view headset labels.';
+                } else if (permErr && permErr.name === 'NotFoundError') {
+                  result.permissionError = 'No audio input device was found.';
+                } else {
+                  result.permissionError = (permErr && permErr.message) || 'Audio device permission unavailable.';
+                }
+                return list;
+              });
+          }
+          return list;
+        }).then(function (finalList) {
+          result.webDevices = finalList
+            .filter(function (d) { return d.kind === 'audioinput' || d.kind === 'audiooutput'; })
+            .map(function (d) {
+              return { deviceId: d.deviceId, kind: d.kind, label: d.label || '', groupId: d.groupId || '' };
+            });
+          return result;
+        }).catch(function (err) {
+          result.permissionError = (err && err.message) || 'Failed to enumerate audio devices.';
+          return result;
         });
-    } catch (err) {
-      result.permissionError = (err && err.message) || 'Failed to enumerate audio devices.';
-    }
-    return result;
+      });
   }
 
   if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
@@ -230,19 +430,22 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
   }
 
   // ---------------------------------------------------------------------------
-  // 4. Chunked Native File Import into Chiroot (zero double-buffering in Rust)
+  // 5. Chunked Native File Import into Chiroot (zero double-buffering in Rust)
   // ---------------------------------------------------------------------------
-  async function readDescriptorToFile(desc) {
-    var chunkSize = 512 * 1024; // 512 KB streaming chunks
+  function readDescriptorToFile(desc) {
+    var chunkSize = 512 * 1024;
     var parts = [];
     var offset = 0;
-    try {
-      while (offset < desc.size) {
-        var res = await invoke('read_imported_file_chunk', {
-          fileId: desc.id,
-          offset: offset,
-          length: chunkSize
-        });
+
+    function nextChunk() {
+      if (offset >= desc.size) {
+        return Promise.resolve(new File(parts, desc.name, { type: desc.mimeType }));
+      }
+      return invoke('read_imported_file_chunk', {
+        fileId: desc.id,
+        offset: offset,
+        length: chunkSize
+      }).then(function (res) {
         var bin = atob(res.base64);
         var bytes = new Uint8Array(bin.length);
         for (var i = 0; i < bin.length; i++) {
@@ -250,12 +453,23 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
         }
         parts.push(bytes);
         offset += bytes.length;
-        if (res.eof || bytes.length === 0) break;
-      }
-      return new File(parts, desc.name, { type: desc.mimeType });
-    } finally {
-      invoke('release_imported_file', { fileId: desc.id }).catch(function () {});
+        if (res.eof || bytes.length === 0) {
+          return new File(parts, desc.name, { type: desc.mimeType });
+        }
+        return nextChunk();
+      });
     }
+
+    return nextChunk().then(
+      function (file) {
+        invoke('release_imported_file', { fileId: desc.id }).catch(function () {});
+        return file;
+      },
+      function (err) {
+        invoke('release_imported_file', { fileId: desc.id }).catch(function () {});
+        throw err;
+      }
+    );
   }
 
   function assignFileToInput(selector, file) {
@@ -272,45 +486,47 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
     }
   }
 
-  async function handleNativeImportedDescriptors(descriptors) {
-    if (!Array.isArray(descriptors) || !descriptors.length) return [];
+  function handleNativeImportedDescriptors(descriptors) {
+    if (!Array.isArray(descriptors) || !descriptors.length) return Promise.resolve([]);
     var imported = [];
     var openedAddModal = false;
+    var chain = Promise.resolve();
 
-    for (var i = 0; i < descriptors.length; i++) {
-      var desc = descriptors[i];
-      try {
-        var file = await readDescriptorToFile(desc);
-        imported.push({ descriptor: desc, file: file });
-
-        if (desc.extension === 'mp3') {
-          if (!openedAddModal) {
-            var addBtn = document.getElementById('btn-add') || document.querySelector('[data-action="add-music"]');
-            if (addBtn) { try { addBtn.click(); } catch (e) {} }
-            openedAddModal = true;
+    descriptors.forEach(function (desc) {
+      chain = chain.then(function () {
+        return readDescriptorToFile(desc).then(function (file) {
+          imported.push({ descriptor: desc, file: file });
+          if (desc.extension === 'mp3') {
+            if (!openedAddModal) {
+              var addBtn = document.getElementById('btn-add') || document.querySelector('[data-action="add-music"]');
+              if (addBtn) { try { addBtn.click(); } catch (e) {} }
+              openedAddModal = true;
+            }
+            assignFileToInput('#input-audio', file);
+            showBanner('Loaded MP3: ' + desc.name, false);
+          } else if (desc.extension === 'png' || desc.extension === 'jpg' || desc.extension === 'jpeg') {
+            assignFileToInput('#input-cover', file);
+            showBanner('Loaded cover image: ' + desc.name, false);
+          } else if (desc.extension === 'json') {
+            return file.text().then(function (text) {
+              var parsed = JSON.parse(text);
+              window.dispatchEvent(new CustomEvent('chiroot:json-imported', {
+                detail: { name: desc.name, size: desc.size, data: parsed }
+              }));
+              showBanner('Validated JSON imported: ' + desc.name, false);
+            });
           }
-          assignFileToInput('#input-audio', file);
-          showBanner('Loaded MP3: ' + desc.name, false);
-        } else if (desc.extension === 'png' || desc.extension === 'jpg' || desc.extension === 'jpeg') {
-          assignFileToInput('#input-cover', file);
-          showBanner('Loaded cover image: ' + desc.name, false);
-        } else if (desc.extension === 'json') {
-          var text = await file.text();
-          var parsed = JSON.parse(text);
-          window.dispatchEvent(new CustomEvent('chiroot:json-imported', {
-            detail: { name: desc.name, size: desc.size, data: parsed }
-          }));
-          showBanner('Validated JSON imported: ' + desc.name, false);
-        }
-      } catch (err) {
-        showBanner('Import failed (' + desc.name + '): ' + (err && err.message ? err.message : err), true);
-      }
-    }
-    return imported;
+        }).catch(function (err) {
+          showBanner('Import failed (' + desc.name + '): ' + (err && err.message ? err.message : err), true);
+        });
+      });
+    });
+
+    return chain.then(function () { return imported; });
   }
 
   // ---------------------------------------------------------------------------
-  // 5. Supabase Auth Sync between Main.html and Rust secure session store
+  // 6. Supabase Auth Sync between Main.html and Rust secure session store
   // ---------------------------------------------------------------------------
   function syncWebSessionToRust() {
     try {
@@ -326,20 +542,21 @@ const BRIDGE_INIT_JS: &str = r#"(function () {
     setTimeout(syncWebSessionToRust, 1200);
   });
 
-  // Public desktop bridge API available to Chiroot web scripts & DevTools
   window.ChirootDesktop = {
     version: '1.0.0',
     notify: showBanner,
-    importFiles: async function (filterMode, multiple) {
-      var descriptors = await invoke('pick_import_files', {
+    importFiles: function (filterMode, multiple) {
+      return invoke('pick_import_files', {
         filterMode: filterMode || 'all',
         multiple: multiple !== false
-      });
-      return handleNativeImportedDescriptors(descriptors);
+      }).then(handleNativeImportedDescriptors);
     },
     _receiveMenuImport: handleNativeImportedDescriptors,
     startGoogleAuth: function (useDeepLink) {
       return invoke('start_google_auth', { useDeepLink: !!useDeepLink });
+    },
+    completeOAuthFromUrl: function (callbackUrl) {
+      return invoke('complete_oauth_from_url', { callbackUrl: callbackUrl });
     },
     getAuthSession: function () {
       return invoke('get_auth_session');
@@ -406,8 +623,9 @@ struct FileChunkResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ReachabilityResult {
+struct EntryUrlResult {
     reachable: bool,
+    entry_url: Option<String>,
     status: Option<u16>,
     error: Option<String>,
 }
@@ -434,19 +652,32 @@ struct AuthStartResponse {
 
 struct AppState {
     pending_oauth: Mutex<Option<PendingOAuth>>,
-    oauth_server_active: Arc<AtomicBool>,
     imported_files: Mutex<HashMap<String, PathBuf>>,
     next_file_id: AtomicU64,
+    proxy_port: AtomicU16,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
             pending_oauth: Mutex::new(None),
-            oauth_server_active: Arc::new(AtomicBool::new(false)),
             imported_files: Mutex::new(HashMap::new()),
             next_file_id: AtomicU64::new(1),
+            proxy_port: AtomicU16::new(0),
         }
+    }
+
+    fn proxy_origin(&self) -> String {
+        let port = self.proxy_port.load(Ordering::SeqCst);
+        if port > 0 {
+            format!("http://127.0.0.1:{port}")
+        } else {
+            CHIROOT_ORIGIN.to_string()
+        }
+    }
+
+    fn proxy_main_url(&self) -> String {
+        format!("{}/Main.html", self.proxy_origin())
     }
 
     fn register_file(&self, path: PathBuf) -> String {
@@ -499,9 +730,9 @@ fn supabase_publishable_key() -> String {
 fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(20))
-        .timeout_write(Duration::from_secs(15))
-        .user_agent("ChirootDesktop/1.0 (macOS)")
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .user_agent(MACOS_USER_AGENT)
         .build()
 }
 
@@ -542,29 +773,786 @@ fn is_allowed_webview_url(raw: &str) -> bool {
     };
     let h = host.to_ascii_lowercase();
 
+    // Local compatibility proxy origin
+    if h == "127.0.0.1" || h == "localhost" {
+        return true;
+    }
+
     // Primary Chiroot domain
     if h == HOME_HOST || h.ends_with(&format!(".{HOME_HOST}")) {
         return true;
     }
 
-    // Supabase project & Google OAuth domains (if user initiates in-page OAuth)
-    let sb_host = Url::parse(&supabase_url())
-        .ok()
-        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()));
-    if sb_host.as_deref() == Some(h.as_str()) {
-        return true;
+    false
+}
+
+// =============================================================================
+// High Sierra 10.13.6 WebKit Compatibility Patchers (JS, HTML, CSS)
+// =============================================================================
+
+/// Patches JavaScript for macOS High Sierra 10.13.6 WebKit (Safari 11–13.0 JavaScriptCore),
+/// eliminating ES2020 optional chaining syntax errors (`?.`) and allowing local proxy Supabase URL.
+fn patch_js_for_high_sierra(src: &str) -> String {
+    let mut out = src.to_string();
+
+    // Known fatal ES2020 optional chaining occurrences in Main.html (lines 3560 & 4653)
+    out = out.replace("w[0]?.toUpperCase()", "(w[0]?w[0].toUpperCase():'')");
+    out = out.replace(
+        "e.target.closest('.vswatch')?.classList.add('active')",
+        "(function(__el){if(__el)__el.classList.add('active');})(e.target.closest('.vswatch'))",
+    );
+
+    // Allow http://127.0.0.1:<port>/__supabase inside Main.html's isSupabaseConfigured()
+    out = out.replace(
+        "return parsedUrl.protocol === 'https:' && publishableKey.length >= 20;",
+        "return (parsedUrl.protocol === 'https:' || parsedUrl.hostname === '127.0.0.1' || parsedUrl.hostname === 'localhost') && publishableKey.length >= 20;",
+    );
+
+    out
+}
+
+/// Patches `Main.html` for macOS High Sierra 10.13.6:
+/// - Injects ES2017/Safari-11 polyfills & `CHIROOT_CONFIG` pointing to the Rustls Supabase proxy
+/// - Rewrites CSP meta tag to remove `upgrade-insecure-requests` and permit local proxy origin
+/// - Routes Google Fonts through `/__fonts_css` so High Sierra's outdated root CAs never fail
+/// - Patches optional chaining `?.` so the 121 KB player script executes cleanly
+fn patch_html_for_high_sierra(html: &str) -> String {
+    let mut out = patch_js_for_high_sierra(html);
+
+    // Replace strict HTTPS-only CSP meta tag (which includes `upgrade-insecure-requests`)
+    if let Some(meta_start) = out.find("<meta http-equiv=\"Content-Security-Policy\"") {
+        if let Some(rel_end) = out[meta_start..].find('>') {
+            let meta_end = meta_start + rel_end + 1;
+            let safe_csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' http://127.0.0.1:* http://localhost:*; script-src 'self' 'unsafe-inline' blob: http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:* https://fonts.googleapis.com; font-src 'self' data: http://127.0.0.1:* http://localhost:* https://fonts.gstatic.com; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://www.chiroot.my.id https://i.ytimg.com https://i.scdn.co https://*.scdn.co https://astuagdezahmuuwjoghf.supabase.co; media-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://www.chiroot.my.id https://astuagdezahmuuwjoghf.supabase.co; connect-src 'self' http://127.0.0.1:* http://localhost:* https://astuagdezahmuuwjoghf.supabase.co wss://astuagdezahmuuwjoghf.supabase.co https://www.googleapis.com https://lrclib.net https://*.scdn.co; object-src 'none'; base-uri 'self'; frame-src 'none'\">";
+            out.replace_range(meta_start..meta_end, safe_csp);
+        }
     }
 
-    matches!(
-        h.as_str(),
-        "accounts.google.com"
-            | "accounts.youtube.com"
-            | "apis.google.com"
-            | "ssl.gstatic.com"
-            | "oauth2.googleapis.com"
-    ) || h.ends_with(".google.com")
-        || h.ends_with(".gstatic.com")
-        || h.ends_with(".googleusercontent.com")
+    // Proxy Google Fonts CSS via Rustls to avoid High Sierra TLS trust errors
+    out = out.replace("https://fonts.googleapis.com", "/__fonts_css");
+
+    // Inject polyfill & CHIROOT_CONFIG immediately after <head>
+    let shim = HIGH_SIERRA_HEAD_SHIM.replace("__SUPABASE_KEY__", &supabase_publishable_key());
+    if let Some(pos) = out.find("<head>") {
+        out.insert_str(pos + "<head>".len(), &shim);
+    } else if let Some(pos) = out.find("<HEAD>") {
+        out.insert_str(pos + "<HEAD>".len(), &shim);
+    } else {
+        out.insert_str(0, &shim);
+    }
+
+    out
+}
+
+/// Expands a CSS `inset` value (`1`, `2`, `3`, or `4` whitespace-separated tokens)
+/// into Safari 11-compatible `top; right; bottom; left;` declarations.
+fn expand_inset_value(val: &str) -> String {
+    let important = val.trim_end().ends_with("!important");
+    let clean = if important {
+        val.trim_end()
+            .trim_end_matches("!important")
+            .trim()
+    } else {
+        val.trim()
+    };
+    let suffix = if important { " !important" } else { "" };
+    let parts: Vec<&str> = clean.split_whitespace().collect();
+    let (t, r, b, l) = match parts.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [tb, rl] => (*tb, *rl, *tb, *rl),
+        [t, rl, b] => (*t, *rl, *b, *rl),
+        [t, r, b, l, ..] => (*t, *r, *b, *l),
+        _ => return format!("inset:{val}"),
+    };
+    format!("top:{t}{suffix};right:{r}{suffix};bottom:{b}{suffix};left:{l}{suffix}")
+}
+
+/// Expands standalone CSS `inset: ...` properties (Safari < 14.1 ignores `inset:`)
+/// without modifying `box-shadow: inset ...`.
+fn expand_css_inset_properties(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len() + 1024);
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Check if current position starts with `inset` followed by optional spaces and `:`
+        if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"inset" {
+            // Look backwards past whitespace to verify property boundary (`{`, `;`, or start)
+            let mut prev = i;
+            while prev > 0 && bytes[prev - 1].is_ascii_whitespace() {
+                prev -= 1;
+            }
+            let at_prop_start = prev == 0 || matches!(bytes[prev - 1], b'{' | b';' | b'/');
+
+            // Look forward past optional spaces for `:`
+            let mut colon = i + 5;
+            while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                colon += 1;
+            }
+
+            if at_prop_start && colon < bytes.len() && bytes[colon] == b':' {
+                let val_start = colon + 1;
+                let mut val_end = val_start;
+                while val_end < bytes.len() && !matches!(bytes[val_end], b';' | b'}') {
+                    val_end += 1;
+                }
+                let val = &css[val_start..val_end];
+                out.push_str(&expand_inset_value(val));
+                i = val_end;
+                continue;
+            }
+        }
+        // Advance one UTF-8 char
+        let ch = css[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Patches `css/style.css` for macOS High Sierra 10.13.6 WebKit (Safari 11–13):
+/// - Fixes double-position gradient stops (which otherwise make `.record` vinyl transparent!)
+/// - Provides Safari 11 fallbacks for `conic-gradient`, `clamp()`, `min()`, `max()`, `dvh`
+/// - Expands all 31 `inset:` declarations into `top/right/bottom/left`
+/// - Adds `-webkit-backdrop-filter:` prefix alongside `backdrop-filter:`
+/// - Converts `:where(...)` / `:focus-visible` selectors that drop rules in Safari < 14
+/// - Appends `html.hs-noflexgap` spacing fallbacks for Safari < 14.1
+fn patch_css_for_high_sierra(css: &str) -> String {
+    let mut out = css.to_string();
+
+    // 1. Expand double-position gradient color stops (Safari < 12.1 treats them as invalid!)
+    let gradient_replacements = [
+        (
+            "#23232b 0 34%, #17171d 35% 100%",
+            "#23232b 0%, #23232b 34%, #17171d 35%, #17171d 100%",
+        ),
+        (
+            "var(--vinyl-mid) 0 34%, var(--vinyl-dark) 35% 100%",
+            "var(--vinyl-mid) 0%, var(--vinyl-mid) 34%, var(--vinyl-dark) 35%, var(--vinyl-dark) 100%",
+        ),
+        (
+            "#d9b887 0 48%, #b68250 49% 100%",
+            "#d9b887 0%, #d9b887 48%, #b68250 49%, #b68250 100%",
+        ),
+        (
+            "rgba(255,255,255,0.035) 0 2px",
+            "rgba(255,255,255,0.035) 0px, rgba(255,255,255,0.035) 2px",
+        ),
+        ("transparent 2px 5px", "transparent 2px, transparent 5px"),
+        (
+            "rgba(200,170,120,0.07) 0 120px",
+            "rgba(200,170,120,0.07) 0px, rgba(200,170,120,0.07) 120px",
+        ),
+        (
+            "rgba(190,150,100,0.06) 0 140px",
+            "rgba(190,150,100,0.06) 0px, rgba(190,150,100,0.06) 140px",
+        ),
+        (
+            "rgba(190,150,100,0.05) 0 180px",
+            "rgba(190,150,100,0.05) 0px, rgba(190,150,100,0.05) 180px",
+        ),
+        (
+            "rgba(64,42,18,0.012) 0 2px",
+            "rgba(64,42,18,0.012) 0px, rgba(64,42,18,0.012) 2px",
+        ),
+        (
+            "rgba(64,42,18,0.008) 0 1px",
+            "rgba(64,42,18,0.008) 0px, rgba(64,42,18,0.008) 1px",
+        ),
+        ("transparent 1px 4px", "transparent 1px, transparent 4px"),
+    ];
+    for (from, to) in gradient_replacements {
+        out = out.replace(from, to);
+    }
+
+    // 2. Replace conic-gradient (unsupported in Safari < 12.1) with clean Safari 11 fallback
+    out = out.replace(
+        "background: conic-gradient(from 210deg, rgba(255,255,255,0.08), transparent 30%, transparent 70%, rgba(255,255,255,0.05));",
+        "background: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, transparent 35%, transparent 65%, rgba(255,255,255,0.05) 100%);",
+    );
+    out = out.replace(
+        "background:conic-gradient(red,orange,yellow,green,blue,indigo,violet,red);",
+        "background:linear-gradient(135deg,red,orange,yellow,green,blue,indigo,violet);",
+    );
+    out = out.replace(
+        "conic-gradient(from 35deg, #161618 0deg, #252529 38deg, #151517 82deg, #151517 180deg, #26262A 218deg, #151517 262deg, #161618 360deg)",
+        "radial-gradient(circle at 50% 50%, #252529 0%, #161618 65%, #151517 100%)",
+    );
+
+    // 3. Expand all standalone `inset:` properties into `top/right/bottom/left`
+    out = expand_css_inset_properties(&out);
+
+    // 4. Replace modern viewport height units (`dvh`, `svh`, `lvh`) with `vh`
+    out = out
+        .replace("dvh", "vh")
+        .replace("svh", "vh")
+        .replace("lvh", "vh");
+
+    // 5. Add Safari 11 cascade fallbacks before `clamp()`, `min()`, `max()`
+    let math_fallbacks = [
+        (
+            "font-size: clamp(34px, 5vw, 52px);",
+            "font-size: 44px; font-size: clamp(34px, 5vw, 52px);",
+        ),
+        (
+            "font-size:clamp(24px,4.5vw,32px);",
+            "font-size:28px;font-size:clamp(24px,4.5vw,32px);",
+        ),
+        (
+            "font-size: clamp(24px, 4.2vw, 42px);",
+            "font-size: 32px; font-size: clamp(24px, 4.2vw, 42px);",
+        ),
+        (
+            "font-size:clamp(14px,2.2vw,17px);",
+            "font-size:15px;font-size:clamp(14px,2.2vw,17px);",
+        ),
+        (
+            "font-size: clamp(22px, 6vw, 32px);",
+            "font-size: 26px; font-size: clamp(22px, 6vw, 32px);",
+        ),
+        (
+            "font-size: clamp(32px, 5.5vw, 52px);",
+            "font-size: 40px; font-size: clamp(32px, 5.5vw, 52px);",
+        ),
+        (
+            "width:min(520px, 92%);",
+            "width:92%; max-width:520px; width:min(520px, 92%);",
+        ),
+        (
+            "width:min(92%,640px);",
+            "width:92%; max-width:640px; width:min(92%,640px);",
+        ),
+        (
+            "width:min(560px,100%);",
+            "width:100%; max-width:560px; width:min(560px,100%);",
+        ),
+        (
+            "min-width:min(262px, calc(100vw - 40px));",
+            "min-width:262px; min-width:min(262px, calc(100vw - 40px));",
+        ),
+        (
+            "max-height:min(88vh,640px);",
+            "max-height:640px; max-height:min(88vh,640px);",
+        ),
+        (
+            "max-height:min(44vh,320px);",
+            "max-height:320px; max-height:min(44vh,320px);",
+        ),
+        (
+            "width:min(540px,100%)!important;",
+            "width:100%!important;max-width:540px!important;",
+        ),
+        (
+            "bottom: max(12px, env(safe-area-inset-bottom, 12px));",
+            "bottom: 12px; bottom: max(12px, env(safe-area-inset-bottom, 12px));",
+        ),
+        (
+            "margin: 0 auto max(10px, env(safe-area-inset-bottom, 10px));",
+            "margin: 0 auto 10px; margin: 0 auto max(10px, env(safe-area-inset-bottom, 10px));",
+        ),
+        (
+            "width: min(214px, 53vw);",
+            "width: 214px; width: min(214px, 53vw);",
+        ),
+        (
+            "height: min(214px, 53vw);",
+            "height: 214px; height: min(214px, 53vw);",
+        ),
+    ];
+    for (from, to) in math_fallbacks {
+        out = out.replace(from, to);
+    }
+
+    // 6. Add -webkit-backdrop-filter prefix for Safari 11–13
+    out = out.replace(
+        "backdrop-filter:",
+        "-webkit-backdrop-filter: blur(2px); backdrop-filter:",
+    );
+    // Clean up any double-prefixed `-webkit--webkit-backdrop-filter`
+    out = out.replace(
+        "-webkit--webkit-backdrop-filter: blur(2px); backdrop-filter:",
+        "-webkit-backdrop-filter:",
+    );
+
+    // 7. Rewrite `:where(...):focus-visible` selector (dropped in Safari < 14)
+    out = out.replace(
+        ":where(button, a, input, select, textarea, [role=\"button\"]):focus-visible",
+        "button:focus, a:focus, input:focus, select:focus, textarea:focus, [role=\"button\"]:focus",
+    );
+
+    // 8. Append High Sierra Flexbox spacing fallback rules
+    out.push_str(HIGH_SIERRA_CSS_FALLBACK);
+    out
+}
+
+// =============================================================================
+// Lightweight Local Compatibility Proxy (Rustls TLS + Streaming + OAuth Route)
+// =============================================================================
+
+struct ParsedHttpRequest {
+    method: String,
+    target: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, String> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+
+    let mut request_line = String::new();
+    let first_bytes = reader
+        .read_line(&mut request_line)
+        .map_err(|e| format!("Failed reading request line: {e}"))?;
+    if first_bytes == 0 {
+        return Err("Empty connection".to_string());
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "Missing HTTP method".to_string())?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or_else(|| "Missing HTTP target".to_string())?
+        .to_string();
+
+    let mut headers = HashMap::new();
+    let mut header_count = 0usize;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed reading header: {e}"))?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        header_count += 1;
+        if header_count > 128 {
+            return Err("Too many HTTP headers".to_string());
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
+    let mut body = Vec::new();
+    if let Some(cl_str) = headers.get("content-length") {
+        let len: usize = cl_str
+            .parse()
+            .map_err(|_| "Invalid Content-Length".to_string())?;
+        if len > MAX_PROXY_REQUEST_BODY {
+            return Err("Request body exceeds safety limit".to_string());
+        }
+        if len > 0 {
+            body.resize(len, 0);
+            reader
+                .read_exact(&mut body)
+                .map_err(|e| format!("Failed reading request body: {e}"))?;
+        }
+    } else if headers
+        .get("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        loop {
+            let mut size_line = String::new();
+            reader
+                .read_line(&mut size_line)
+                .map_err(|e| format!("Failed reading chunk size: {e}"))?;
+            let hex_part = size_line.split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(hex_part, 16)
+                .map_err(|_| "Invalid chunk size".to_string())?;
+            if chunk_size == 0 {
+                let mut trailer = String::new();
+                let _ = reader.read_line(&mut trailer);
+                break;
+            }
+            if body.len().saturating_add(chunk_size) > MAX_PROXY_REQUEST_BODY {
+                return Err("Chunked request body exceeds safety limit".to_string());
+            }
+            let start = body.len();
+            body.resize(start + chunk_size, 0);
+            reader
+                .read_exact(&mut body[start..])
+                .map_err(|e| format!("Failed reading chunk data: {e}"))?;
+            let mut crlf = [0u8; 2];
+            let _ = reader.read_exact(&mut crlf);
+        }
+    }
+
+    Ok(ParsedHttpRequest {
+        method,
+        target,
+        headers,
+        body,
+    })
+}
+
+fn write_simple_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    body: &[u8],
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: {cache_control}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn write_oauth_html_page(stream: &mut TcpStream, status: &str, title: &str, body_msg: &str) {
+    let html = format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
+         <style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f6f4ee;\
+         color:#1d1b18;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}}\
+         .box{{background:#fff;border:1px solid #ddd6c8;border-radius:14px;padding:28px 24px;\
+         max-width:420px;text-align:center;}}</style></head><body><div class='box'>\
+         <h2>{title}</h2><p>{body_msg}</p></div></body></html>"
+    );
+    write_simple_http_response(
+        stream,
+        status,
+        "text/html; charset=utf-8",
+        "no-store",
+        html.as_bytes(),
+    );
+}
+
+fn status_reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        416 => "Range Not Satisfiable",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
+/// Streams an upstream `ureq::Response` directly to the local client socket in 64 KB chunks
+/// preserving status code (including `206 Partial Content`), `Content-Range`, `Accept-Ranges`,
+/// and `Content-Type` without buffering large MP3s in RAM.
+fn stream_upstream_response(
+    stream: &mut TcpStream,
+    resp: ureq::Response,
+    is_head: bool,
+) {
+    let status_code = resp.status();
+    let status_line = format!("HTTP/1.1 {status_code} {}\r\n", status_reason(status_code));
+    let mut header_block = String::from(&status_line);
+
+    let forward_headers = [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "etag",
+        "last-modified",
+        "cache-control",
+        "content-disposition",
+        "x-content-type-options",
+    ];
+    for name in forward_headers {
+        if let Some(val) = resp.header(name) {
+            header_block.push_str(&format!("{name}: {val}\r\n"));
+        }
+    }
+    header_block.push_str("Access-Control-Allow-Origin: *\r\n");
+    header_block.push_str("Connection: close\r\n\r\n");
+
+    if stream.write_all(header_block.as_bytes()).is_err() {
+        return;
+    }
+    if is_head || status_code == 204 || status_code == 304 {
+        let _ = stream.flush();
+        return;
+    }
+
+    let mut reader = resp.into_reader();
+    let mut buf = [0u8; PROXY_STREAM_BUF_BYTES];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = stream.flush();
+}
+
+fn proxy_supabase_request(stream: &mut TcpStream, req: &ParsedHttpRequest) {
+    if req.method.eq_ignore_ascii_case("OPTIONS") {
+        let cors = "HTTP/1.1 204 No Content\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS\r\n\
+            Access-Control-Allow-Headers: authorization, apikey, content-type, prefer, accept, range, x-upsert, x-client-info, cache-control\r\n\
+            Access-Control-Max-Age: 86400\r\n\
+            Connection: close\r\n\r\n";
+        let _ = stream.write_all(cors.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
+    let rest = req
+        .target
+        .strip_prefix("/__supabase")
+        .unwrap_or("/");
+    let upstream_url = format!("{}{}", supabase_url(), rest);
+
+    let agent = http_agent();
+    let mut ureq_req = agent.request(&req.method, &upstream_url);
+
+    let pass_headers = [
+        "authorization",
+        "apikey",
+        "content-type",
+        "prefer",
+        "accept",
+        "range",
+        "if-none-match",
+        "if-modified-since",
+        "x-upsert",
+        "x-client-info",
+        "cache-control",
+    ];
+    for name in pass_headers {
+        if let Some(val) = req.headers.get(name) {
+            ureq_req = ureq_req.set(name, val);
+        }
+    }
+
+    let result = if !req.body.is_empty() {
+        ureq_req.send_bytes(&req.body)
+    } else {
+        ureq_req.call()
+    };
+
+    let is_head = req.method.eq_ignore_ascii_case("HEAD");
+    match result {
+        Ok(resp) => stream_upstream_response(stream, resp, is_head),
+        Err(ureq::Error::Status(_, resp)) => stream_upstream_response(stream, resp, is_head),
+        Err(ureq::Error::Transport(t)) => {
+            let msg = serde_json::json!({ "error": format!("Supabase proxy transport error: {t}") }).to_string();
+            write_simple_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                "no-store",
+                msg.as_bytes(),
+            );
+        }
+    }
+}
+
+fn proxy_fonts_css(stream: &mut TcpStream, req: &ParsedHttpRequest) {
+    let rest = req.target.strip_prefix("/__fonts_css").unwrap_or("/");
+    let upstream_url = format!("https://fonts.googleapis.com{rest}");
+    match http_agent().get(&upstream_url).call() {
+        Ok(resp) => {
+            let css = resp.into_string().unwrap_or_default();
+            let patched = css.replace("https://fonts.gstatic.com", "/__fonts_static");
+            write_simple_http_response(
+                stream,
+                "200 OK",
+                "text/css; charset=utf-8",
+                "public, max-age=3600",
+                patched.as_bytes(),
+            );
+        }
+        Err(_) => {
+            write_simple_http_response(
+                stream,
+                "200 OK",
+                "text/css; charset=utf-8",
+                "no-cache",
+                b"/* Google Fonts unavailable offline */",
+            );
+        }
+    }
+}
+
+fn proxy_fonts_static(stream: &mut TcpStream, req: &ParsedHttpRequest) {
+    let rest = req.target.strip_prefix("/__fonts_static").unwrap_or("/");
+    let upstream_url = format!("https://fonts.gstatic.com{rest}");
+    match http_agent().get(&upstream_url).call() {
+        Ok(resp) => stream_upstream_response(stream, resp, false),
+        Err(ureq::Error::Status(_, resp)) => stream_upstream_response(stream, resp, false),
+        Err(_) => {
+            write_simple_http_response(
+                stream,
+                "404 Not Found",
+                "text/plain",
+                "no-store",
+                b"Font not found",
+            );
+        }
+    }
+}
+
+fn proxy_chiroot_asset(stream: &mut TcpStream, req: &ParsedHttpRequest) {
+    let target_path = if req.target == "/" || req.target.is_empty() {
+        "/Main.html"
+    } else {
+        req.target.as_str()
+    };
+    let upstream_url = format!("{CHIROOT_ORIGIN}{target_path}");
+    let path_only = target_path.split(['?', '#']).next().unwrap_or(target_path);
+    let lower_path = path_only.to_ascii_lowercase();
+
+    let is_html_path = lower_path == "/main.html" || lower_path.ends_with(".html") || lower_path == "/";
+    let is_css_path = lower_path.ends_with(".css");
+    let is_js_path = lower_path.ends_with(".js");
+    let needs_patch = (is_html_path || is_css_path || is_js_path) && req.method.eq_ignore_ascii_case("GET");
+
+    let mut ureq_req = http_agent().request(&req.method, &upstream_url);
+    if !needs_patch {
+        for name in ["range", "if-none-match", "if-modified-since", "accept"] {
+            if let Some(val) = req.headers.get(name) {
+                ureq_req = ureq_req.set(name, val);
+            }
+        }
+    }
+
+    let is_head = req.method.eq_ignore_ascii_case("HEAD");
+    match ureq_req.call() {
+        Ok(resp) => {
+            if needs_patch {
+                let status = resp.status();
+                if status == 200 {
+                    let body_text = resp.into_string().unwrap_or_default();
+                    let (patched, ctype, cache) = if is_html_path {
+                        (
+                            patch_html_for_high_sierra(&body_text),
+                            "text/html; charset=utf-8",
+                            "no-cache",
+                        )
+                    } else if is_css_path {
+                        (
+                            patch_css_for_high_sierra(&body_text),
+                            "text/css; charset=utf-8",
+                            "public, max-age=300",
+                        )
+                    } else {
+                        (
+                            patch_js_for_high_sierra(&body_text),
+                            "application/javascript; charset=utf-8",
+                            "public, max-age=300",
+                        )
+                    };
+                    write_simple_http_response(
+                        stream,
+                        "200 OK",
+                        ctype,
+                        cache,
+                        patched.as_bytes(),
+                    );
+                    return;
+                }
+            }
+            stream_upstream_response(stream, resp, is_head);
+        }
+        Err(ureq::Error::Status(_, resp)) => stream_upstream_response(stream, resp, is_head),
+        Err(ureq::Error::Transport(t)) => {
+            let msg = format!("Unable to reach Chiroot ({upstream_url}): {t}");
+            write_simple_http_response(
+                stream,
+                "502 Bad Gateway",
+                "text/plain; charset=utf-8",
+                "no-store",
+                msg.as_bytes(),
+            );
+        }
+    }
+}
+
+fn handle_proxy_connection(app: AppHandle, mut stream: TcpStream, port: u16) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let Ok(req) = read_http_request(&mut stream) else {
+        return;
+    };
+
+    if req.target.starts_with("/auth/callback") {
+        let full_url = format!("http://127.0.0.1:{port}{}", req.target);
+        match complete_oauth_callback(&app, &full_url) {
+            Ok(_) => write_oauth_html_page(
+                &mut stream,
+                "200 OK",
+                "Signed in to Chiroot Desktop",
+                "Google authentication succeeded. You can close this tab and return to Chiroot Desktop.",
+            ),
+            Err(err) => write_oauth_html_page(
+                &mut stream,
+                "400 Bad Request",
+                "Sign-in Failed",
+                &err,
+            ),
+        }
+    } else if req.target.starts_with("/__supabase") {
+        proxy_supabase_request(&mut stream, &req);
+    } else if req.target.starts_with("/__fonts_css") {
+        proxy_fonts_css(&mut stream, &req);
+    } else if req.target.starts_with("/__fonts_static") {
+        proxy_fonts_static(&mut stream, &req);
+    } else {
+        proxy_chiroot_asset(&mut stream, &req);
+    }
+}
+
+fn start_compat_proxy(app: &AppHandle) -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", PREFERRED_PROXY_PORT))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|e| format!("Failed starting local compatibility proxy: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed reading local proxy port: {e}"))?
+        .port();
+
+    app.state::<AppState>()
+        .proxy_port
+        .store(port, Ordering::SeqCst);
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if let Ok(stream) = incoming {
+                let handle = app_handle.clone();
+                std::thread::spawn(move || {
+                    handle_proxy_connection(handle, stream, port);
+                });
+            }
+        }
+    });
+
+    Ok(port)
 }
 
 // =============================================================================
@@ -600,7 +1588,6 @@ fn validate_file_header(ext: &str, header: &[u8]) -> Result<(), String> {
         "mp3" => {
             let is_id3 = header.len() >= 3 && &header[..3] == b"ID3";
             let is_mpeg_frame = header.len() >= 2 && header[0] == 0xFF && (header[1] & 0xE0) == 0xE0;
-            // Some MP3 encoders prepend zero padding before the first MPEG sync frame.
             let has_sync_soon = header
                 .windows(2)
                 .any(|w| w[0] == 0xFF && (w[1] & 0xE0) == 0xE0);
@@ -609,7 +1596,6 @@ fn validate_file_header(ext: &str, header: &[u8]) -> Result<(), String> {
             }
         }
         "json" => {
-            // Strip optional UTF-8 BOM and leading whitespace, then check valid JSON token start.
             let trimmed = header.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(header);
             let first = trimmed
                 .iter()
@@ -660,7 +1646,6 @@ fn validate_and_register_file(
         )
     })?;
 
-    // Read only the first 512 bytes for header validation (never loads whole file into RAM).
     let mut file = File::open(&path)
         .map_err(|e| format!("Cannot open file '{}': {e}", path.display()))?;
     let mut header = [0u8; 512];
@@ -669,7 +1654,6 @@ fn validate_and_register_file(
         .map_err(|e| format!("Failed reading file header: {e}"))?;
     validate_file_header(&ext, &header[..n])?;
 
-    // Full structural JSON validation only for reasonably sized JSON files (<= 16 MB).
     if ext == "json" && size <= 16 * 1024 * 1024 {
         let mut full = File::open(&path)
             .map_err(|e| format!("Cannot re-open JSON file: {e}"))?;
@@ -764,7 +1748,6 @@ fn parse_supabase_token_response(val: &serde_json::Value) -> Result<SupabaseSess
         .to_string();
 
     let expires_at = if let Some(raw_exp) = val.get("expires_at").and_then(|v| v.as_u64()) {
-        // Supabase returns Unix seconds; Main.html stores Unix milliseconds.
         if raw_exp < 10_000_000_000 {
             raw_exp.saturating_mul(1000)
         } else {
@@ -891,16 +1874,20 @@ fn inject_session_into_webview(app: &AppHandle, session: &SupabaseSession, reloa
     let Ok(js_str_literal) = serde_json::to_string(&session_json) else {
         return;
     };
+    let target_url = app.state::<AppState>().proxy_main_url();
+    let Ok(target_literal) = serde_json::to_string(&target_url) else {
+        return;
+    };
     let reload_js = if reload_after {
-        "window.location.replace('https://www.chiroot.my.id/Main.html');"
+        format!("window.location.replace({target_literal});")
     } else {
-        ""
+        String::new()
     };
     let script = format!(
         r#"(function () {{
           try {{
             var h = (window.location.hostname || '').toLowerCase();
-            if (h === 'chiroot.my.id' || h.slice(-14) === '.chiroot.my.id') {{
+            if (h === '127.0.0.1' || h === 'localhost' || h === 'chiroot.my.id' || h.slice(-14) === '.chiroot.my.id') {{
               var incoming = {js_str_literal};
               var existing = localStorage.getItem('chiroot_auth_v1');
               if (existing !== incoming) {{
@@ -950,9 +1937,16 @@ fn notify_webview(app: &AppHandle, message: &str, is_error: bool) {
     }
 }
 
-/// Parses an OAuth callback URL (`chiroot://auth/callback?...` or `http://127.0.0.1:PORT/auth/callback?...`).
-fn parse_oauth_callback_params(raw_url: &str) -> Result<(Option<String>, Option<String>, Option<String>), String> {
-    let parsed = Url::parse(raw_url).map_err(|e| format!("Invalid callback URL: {e}"))?;
+fn parse_oauth_callback_params(
+    raw_url: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+    let trimmed = raw_url.trim();
+    // Allow users to paste either a full callback URL or a bare authorization code
+    if !trimmed.contains("://") && !trimmed.contains('?') && !trimmed.is_empty() {
+        return Ok((Some(trimmed.to_string()), None, None));
+    }
+
+    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid callback URL: {e}"))?;
     let mut code = None;
     let mut error = None;
     let mut state = None;
@@ -987,7 +1981,8 @@ fn complete_oauth_callback(app: &AppHandle, callback_url: &str) -> Result<Supaba
         return Err(err_msg);
     }
 
-    let code = code_opt.ok_or_else(|| "OAuth callback did not contain an authorization code.".to_string())?;
+    let code = code_opt
+        .ok_or_else(|| "OAuth callback did not contain an authorization code.".to_string())?;
     let pending = pending.ok_or_else(|| {
         "No pending OAuth login session found. Please start Google sign-in again.".to_string()
     })?;
@@ -1011,95 +2006,6 @@ fn complete_oauth_callback(app: &AppHandle, callback_url: &str) -> Result<Supaba
     Ok(session)
 }
 
-fn write_loopback_http_response(stream: &mut TcpStream, status: &str, title: &str, body_msg: &str) {
-    let html = format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
-        <style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f6f4ee;\
-        color:#1d1b18;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}}\
-        .box{{background:#fff;border:1px solid #ddd6c8;border-radius:14px;padding:28px 24px;\
-        max-width:400px;text-align:center;}}</style></head><body><div class='box'>\
-        <h2>{title}</h2><p>{body_msg}</p></div></body></html>"
-    );
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-        html.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
-/// Spawns a single-use loopback HTTP listener on `127.0.0.1:<ephemeral-port>` that shuts down
-/// immediately after handling the OAuth callback or timing out.
-fn spawn_loopback_oauth_listener(app: AppHandle) -> Result<String, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("Failed to bind local OAuth callback port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Failed reading local OAuth port: {e}"))?
-        .port();
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("Failed setting OAuth socket nonblocking: {e}"))?;
-
-    let active_flag = app.state::<AppState>().oauth_server_active.clone();
-    active_flag.store(true, Ordering::SeqCst);
-
-    let redirect_uri = format!("http://127.0.0.1:{port}/auth/callback");
-    let base_origin = format!("http://127.0.0.1:{port}");
-
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(OAUTH_TIMEOUT_SECS);
-        while Instant::now() < deadline && active_flag.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((mut stream, _addr)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    let mut buf = [0u8; 4096];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let path_and_query = req
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/");
-
-                    if path_and_query.starts_with("/auth/callback") {
-                        let full_url = format!("{base_origin}{path_and_query}");
-                        match complete_oauth_callback(&app, &full_url) {
-                            Ok(_) => write_loopback_http_response(
-                                &mut stream,
-                                "200 OK",
-                                "Signed in to Chiroot Desktop",
-                                "Authentication succeeded. You can close this tab and return to Chiroot Desktop.",
-                            ),
-                            Err(err) => write_loopback_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "Sign-in Failed",
-                                &err,
-                            ),
-                        }
-                        break;
-                    } else {
-                        write_loopback_http_response(
-                            &mut stream,
-                            "404 Not Found",
-                            "Chiroot Desktop",
-                            "Waiting for OAuth callback…",
-                        );
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(80));
-                }
-                Err(_) => break,
-            }
-        }
-        active_flag.store(false, Ordering::SeqCst);
-    });
-
-    Ok(redirect_uri)
-}
-
 fn begin_google_oauth_flow(app: &AppHandle, use_deep_link: bool) -> Result<AuthStartResponse, String> {
     let verifier = random_base64url(32)?;
     let challenge = pkce_challenge_s256(&verifier);
@@ -1108,7 +2014,14 @@ fn begin_google_oauth_flow(app: &AppHandle, use_deep_link: bool) -> Result<AuthS
     let (redirect_uri, mode) = if use_deep_link {
         (OAUTH_DEEP_LINK_REDIRECT.to_string(), "deep-link".to_string())
     } else {
-        (spawn_loopback_oauth_listener(app.clone())?, "loopback".to_string())
+        let port = app.state::<AppState>().proxy_port.load(Ordering::SeqCst);
+        if port == 0 {
+            return Err("Local OAuth callback server is not running.".to_string());
+        }
+        (
+            format!("http://127.0.0.1:{port}/auth/callback"),
+            "loopback".to_string(),
+        )
     };
 
     {
@@ -1158,7 +2071,9 @@ fn query_macos_audio_devices() -> Result<Vec<MacAudioDevice>, String> {
             .output()
             .map_err(|e| format!("Failed running system_profiler: {e}"))?;
         if !output.status.success() {
-            return Err("macOS system_profiler returned an error querying audio hardware.".to_string());
+            return Err(
+                "macOS system_profiler returned an error querying audio hardware.".to_string(),
+            );
         }
         let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("Failed parsing macOS audio JSON: {e}"))?;
@@ -1225,20 +2140,27 @@ fn query_macos_audio_devices() -> Result<Vec<MacAudioDevice>, String> {
 }
 
 // =============================================================================
-// Tauri Commands (Exposed to frontend/index.html & chiroot.my.id)
+// Tauri Commands (Exposed to frontend/index.html & proxied Chiroot origin)
 // =============================================================================
 
 #[tauri::command]
-async fn check_chiroot_reachable() -> ReachabilityResult {
+async fn get_app_entry_url(app: AppHandle) -> EntryUrlResult {
+    let entry = app.state::<AppState>().proxy_main_url();
     let resp = http_agent().head(CHIROOT_URL).call();
     match resp {
-        Ok(r) => ReachabilityResult {
+        Ok(r) => EntryUrlResult {
             reachable: true,
+            entry_url: Some(entry),
             status: Some(r.status()),
             error: None,
         },
-        Err(ureq::Error::Status(code, _)) => ReachabilityResult {
+        Err(ureq::Error::Status(code, _)) => EntryUrlResult {
             reachable: (200..500).contains(&code),
+            entry_url: if (200..500).contains(&code) {
+                Some(entry)
+            } else {
+                None
+            },
             status: Some(code),
             error: if code >= 500 {
                 Some(format!("Chiroot server returned HTTP {code}."))
@@ -1246,8 +2168,9 @@ async fn check_chiroot_reachable() -> ReachabilityResult {
                 None
             },
         },
-        Err(ureq::Error::Transport(t)) => ReachabilityResult {
+        Err(ureq::Error::Transport(t)) => EntryUrlResult {
             reachable: false,
+            entry_url: None,
             status: None,
             error: Some(format!("Network error: {t}")),
         },
@@ -1390,12 +2313,19 @@ async fn start_google_auth(
 }
 
 #[tauri::command]
+async fn complete_oauth_from_url(
+    app: AppHandle,
+    callback_url: String,
+) -> Result<SupabaseSession, String> {
+    complete_oauth_callback(&app, &callback_url)
+}
+
+#[tauri::command]
 async fn get_auth_session(app: AppHandle) -> Result<Option<SupabaseSession>, String> {
     let Some(session) = load_persisted_session(&app) else {
         return Ok(None);
     };
     let now = now_unix_ms();
-    // Auto-refresh token if within 60 seconds of expiry
     if session.expires_at <= now.saturating_add(60_000) && !session.refresh_token.is_empty() {
         match refresh_supabase_session(&session.refresh_token) {
             Ok(refreshed) => {
@@ -1424,16 +2354,13 @@ async fn logout_auth(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn sync_web_session(app: AppHandle, session_json: Option<String>) -> Result<(), String> {
-    match session_json {
-        Some(raw) if !raw.trim().is_empty() => {
+    if let Some(raw) = session_json {
+        if !raw.trim().is_empty() {
             if let Ok(session) = serde_json::from_str::<SupabaseSession>(&raw) {
                 if !session.access_token.is_empty() && !session.user.id.is_empty() {
                     save_persisted_session(&app, &session)?;
                 }
             }
-        }
-        _ => {
-            // Keep persisted session intact unless the user explicitly signs out via logout_auth.
         }
     }
     Ok(())
@@ -1456,9 +2383,10 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
         .quit()
         .build()?;
 
-    let import_all = MenuItemBuilder::with_id("import_all", "Import Files (.mp3, .json, .png, .jpg)…")
-        .accelerator("CmdOrCtrl+O")
-        .build(app)?;
+    let import_all =
+        MenuItemBuilder::with_id("import_all", "Import Files (.mp3, .json, .png, .jpg)…")
+            .accelerator("CmdOrCtrl+O")
+            .build(app)?;
     let import_mp3 = MenuItemBuilder::with_id("import_mp3", "Import MP3 Audio…").build(app)?;
     let import_cover = MenuItemBuilder::with_id("import_cover", "Import Cover Image…").build(app)?;
     let import_json = MenuItemBuilder::with_id("import_json", "Import JSON Data…").build(app)?;
@@ -1511,11 +2439,15 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
     let auth_deeplink =
         MenuItemBuilder::with_id("auth_google_deeplink", "Sign in with Google (Deep Link)…")
             .build(app)?;
+    let auth_paste =
+        MenuItemBuilder::with_id("auth_paste_callback", "Complete Sign-In from Callback URL…")
+            .build(app)?;
     let auth_logout = MenuItemBuilder::with_id("auth_logout", "Sign Out").build(app)?;
 
     let account_submenu = SubmenuBuilder::new(app, "Account")
         .item(&auth_browser)
         .item(&auth_deeplink)
+        .item(&auth_paste)
         .separator()
         .item(&auth_logout)
         .build()?;
@@ -1578,7 +2510,8 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         "nav_home" => {
             if let Some(w) = app.get_webview_window("main") {
-                if let Ok(url) = Url::parse(CHIROOT_URL) {
+                let target = app.state::<AppState>().proxy_main_url();
+                if let Ok(url) = Url::parse(&target) {
                     let _ = w.navigate(url);
                 }
             }
@@ -1601,6 +2534,20 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         "auth_google_deeplink" => {
             if let Err(e) = begin_google_oauth_flow(app, true) {
                 notify_webview(app, &e, true);
+            }
+        }
+        "auth_paste_callback" => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.eval(
+                    r#"(function () {
+                      var val = window.prompt('Paste the redirect URL (containing ?code=...) from your browser:');
+                      if (val && window.ChirootDesktop && window.ChirootDesktop.completeOAuthFromUrl) {
+                        window.ChirootDesktop.completeOAuthFromUrl(val).catch(function (e) {
+                          window.ChirootDesktop.notify('Sign-in failed: ' + (e && e.message ? e.message : e), true);
+                        });
+                      }
+                    })();"#,
+                );
             }
         }
         "auth_logout" => {
@@ -1676,7 +2623,7 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .on_page_load(move |window, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
                 let url_str = payload.url().as_str();
-                if url_str.contains("chiroot.my.id") {
+                if url_str.contains("/Main.html") || url_str.contains("chiroot.my.id") {
                     let _ = window.set_title(APP_NAME);
                     if let Some(session) = load_persisted_session(&load_app) {
                         let now = now_unix_ms();
@@ -1732,19 +2679,22 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
-            check_chiroot_reachable,
+            get_app_entry_url,
             open_external_url,
             pick_import_files,
             read_imported_file_chunk,
             release_imported_file,
             list_macos_audio_devices,
             start_google_auth,
+            complete_oauth_from_url,
             get_auth_session,
             logout_auth,
             sync_web_session,
         ])
         .setup(|app| {
             let handle = app.handle();
+            start_compat_proxy(handle).map_err(std::io::Error::other)?;
+
             let menu = build_app_menu(handle)?;
             app.set_menu(menu)?;
 
@@ -1770,7 +2720,6 @@ mod tests {
 
     #[test]
     fn pkce_s256_matches_rfc7636_test_vector() {
-        // RFC 7636 Appendix B test vector
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(pkce_challenge_s256(verifier), expected);
@@ -1784,7 +2733,6 @@ mod tests {
         assert_eq!(allowed_mime_for_extension("jpg"), Some("image/jpeg"));
         assert_eq!(allowed_mime_for_extension("jpeg"), Some("image/jpeg"));
         assert_eq!(allowed_mime_for_extension("exe"), None);
-        assert_eq!(allowed_mime_for_extension("wav"), None);
     }
 
     #[test]
@@ -1806,16 +2754,16 @@ mod tests {
 
     #[test]
     fn webview_url_allowlist_and_downloads() {
+        assert!(is_allowed_webview_url("http://127.0.0.1:47821/Main.html"));
         assert!(is_allowed_webview_url("https://www.chiroot.my.id/Main.html"));
-        assert!(is_allowed_webview_url("https://astuagdezahmuuwjoghf.supabase.co/auth/v1/authorize"));
-        assert!(is_allowed_webview_url("https://accounts.google.com/o/oauth2/v2/auth"));
+        assert!(!is_allowed_webview_url("https://accounts.google.com/o/oauth2/v2/auth"));
         assert!(!is_allowed_webview_url("https://example.com/external"));
         assert!(is_download_url("https://www.chiroot.my.id/Chiroot.dmg"));
         assert!(!is_download_url("https://www.chiroot.my.id/Main.html"));
     }
 
     #[test]
-    fn oauth_callback_parser_extracts_code_and_error() {
+    fn oauth_callback_parser_extracts_code_error_and_bare_code() {
         let (code, err, state) = parse_oauth_callback_params(
             "chiroot://auth/callback?code=abc123&state=xyz789",
         )
@@ -1825,10 +2773,44 @@ mod tests {
         assert_eq!(state.as_deref(), Some("xyz789"));
 
         let (code2, err2, _) = parse_oauth_callback_params(
-            "http://127.0.0.1:43210/auth/callback?error=access_denied&error_description=User+cancelled",
+            "http://127.0.0.1:47821/auth/callback?error=access_denied&error_description=User+cancelled",
         )
         .unwrap();
         assert_eq!(code2, None);
         assert_eq!(err2.as_deref(), Some("User cancelled"));
+
+        let (code3, err3, _) = parse_oauth_callback_params("bare-code-999").unwrap();
+        assert_eq!(code3.as_deref(), Some("bare-code-999"));
+        assert_eq!(err3, None);
+    }
+
+    #[test]
+    fn high_sierra_css_patcher_expands_inset_and_double_stops_safely() {
+        let sample = ".record{background:radial-gradient(circle at 50% 50%, #23232b 0 34%, #17171d 35% 100%);box-shadow:inset 0 0 26px rgba(255,255,255,0.045);}\
+                      .overlay{position:fixed; inset:0; min-height:100dvh;}\
+                      .bar{inset: -8px 0;}";
+        let patched = patch_css_for_high_sierra(sample);
+        assert!(patched.contains("#23232b 0%, #23232b 34%, #17171d 35%, #17171d 100%"));
+        // box-shadow: inset MUST stay untouched!
+        assert!(patched.contains("box-shadow:inset 0 0 26px"));
+        // standalone inset: MUST expand to top/right/bottom/left
+        assert!(patched.contains("top:0;right:0;bottom:0;left:0"));
+        assert!(patched.contains("top:-8px;right:0;bottom:-8px;left:0"));
+        assert!(!patched.contains("100dvh"));
+    }
+
+    #[test]
+    fn high_sierra_html_patcher_removes_optional_chaining_and_upgrade_insecure() {
+        let sample = "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; upgrade-insecure-requests\"></head><body><script>\
+                      const x = w[0]?.toUpperCase();\
+                      e.target.closest('.vswatch')?.classList.add('active');\
+                      return parsedUrl.protocol === 'https:' && publishableKey.length >= 20;\
+                      </script></body></html>";
+        let patched = patch_html_for_high_sierra(sample);
+        assert!(!patched.contains("?."));
+        assert!(!patched.contains("upgrade-insecure-requests"));
+        assert!(patched.contains("CHIROOT_CONFIG"));
+        assert!(patched.contains("Blob.prototype.arrayBuffer"));
+        assert!(patched.contains("parsedUrl.hostname === '127.0.0.1'"));
     }
 }

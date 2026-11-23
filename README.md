@@ -66,8 +66,9 @@ All Rust application logic is centralized in `src/main.rs`:
 
 To allow Google sign-in to return directly from Safari/Chrome back into **Chiroot Desktop**, make sure your Supabase project (**Authentication → URL Configuration → Redirect URLs**) includes:
 
-- `chiroot://auth/callback`
+- `http://127.0.0.1:47821/auth/callback`
 - `http://127.0.0.1:*/auth/callback`
+- `chiroot://auth/callback`
 - `https://www.chiroot.my.id/Main.html`
 
 > **Security Note**: Never put a Supabase `service_role` key in client code or environment files bundled with the app. You may optionally override the public project URL or publishable key at runtime using `CHIROOT_SUPABASE_URL` and `CHIROOT_SUPABASE_KEY`.
